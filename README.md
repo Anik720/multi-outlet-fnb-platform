@@ -359,3 +359,59 @@ cd backend && npm test
 
 ---
 
+## Environment variables
+
+Backend (`backend/.env`, validated at start-up; the process exits on invalid config):
+
+| Variable | Default | Description |
+|---|---|---|
+| `NODE_ENV` | `development` | `development` / `test` / `production` |
+| `PORT` | `4000` | API port |
+| `LOG_LEVEL` | `info` | pino log level |
+| `DATABASE_URL` | – (required) | PostgreSQL connection string |
+| `DB_POOL_MAX` | `10` | Connection pool size per instance |
+| `DB_SSL` | `false` | Enable TLS to the database |
+| `JWT_SECRET` | – (required, ≥ 32 chars) | Token signing secret |
+| `JWT_EXPIRES_IN` | `8h` | Token lifetime |
+| `CORS_ORIGINS` | *(empty = same-origin only)* | Comma-separated allowed origins |
+| `SEED_DEMO_DATA` | `false` | Seed demo data at start-up if the DB is empty |
+
+Frontend: `VITE_API_BASE_URL` (default `/api/v1`, i.e. same origin). Set it to a full URL when the API is
+hosted separately.
+
+---
+
+## Deployment
+
+The stack is container-based and deploys anywhere Docker runs.
+
+**Option A: any VM (e.g. EC2 / DigitalOcean / Lightsail):** install Docker, clone, set a strong
+`JWT_SECRET` in `.env`, run `docker compose up -d --build`, and put a TLS-terminating proxy (Caddy /
+nginx + Let's Encrypt) in front of port 8080.
+
+**Option B: Render (blueprint included):** Render dashboard → *New* → *Blueprint* → select this repo.
+`render.yaml` provisions PostgreSQL, the API (Docker) and the static web app. After the first deploy, set
+`CORS_ORIGINS` on the API to the web URL and `VITE_API_BASE_URL` on the web app to
+`https://<api-host>/api/v1`, then redeploy the web app.
+
+**Deployed instance:** _add the URL here after deploying._
+
+---
+
+## Scaling strategy
+
+Summary (details in [docs/ARCHITECTURE.md §4](docs/ARCHITECTURE.md#4-scaling-plan-10-outlets-100000-transactionsmonth)):
+
+- **Load:** 10 outlets / 100k transactions per month ≈ 0.04 TPS on average and under 1 TPS at peak, which a
+  single well-indexed PostgreSQL handles easily. The design already avoids global hot spots (locks are per
+  outlet and per item).
+- **Database:** managed Postgres with PITR and Multi-AZ → PgBouncer → read replica for reporting →
+  monthly partitioning of sales/ledger tables → archival to a warehouse.
+- **Reporting:** incremental daily rollup tables (or materialized views) + live "today" query, served
+  from a replica and cached; heavy analytics in a warehouse fed by CDC.
+- **Infrastructure:** stateless API containers autoscaled behind a load balancer, SPA on a CDN, CI/CD
+  with migrations as a release step, secrets manager, OpenTelemetry/metrics/alerts.
+- **Architecture:** modular monolith → transactional outbox + event bus → extract Reporting, then
+  Catalog, then Inventory/Orders (saga), only when needed ([§5](docs/ARCHITECTURE.md#5-evolving-to-microservices)).
+- **Offline POS:** local-first terminals + an outlet edge hub (MQTT/WebSocket) so POS ↔ KDS keep working on
+  the LAN; an outbox with idempotent batch sync to HQ when the internet returns ([§6](docs/ARCHITECTURE.md#6-offline-pos-mode-strategy-pos--kds)).
