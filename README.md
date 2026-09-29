@@ -226,3 +226,136 @@ Full ERD with every column and constraint: **[docs/ARCHITECTURE.md → ERD](docs
 
 ---
 
+## API endpoints
+
+Base URL: `/api/v1`. All endpoints except login require `Authorization: Bearer <token>`.
+Successful responses are `{ "data": … }` (lists with pagination add `"pagination"`); errors are
+`{ "error": { "code", "message", "details?", "requestId" } }`.
+
+### Auth
+
+| Method | Path | Who | Description |
+|---|---|---|---|
+| POST | `/auth/login` | public (rate-limited) | `{ email, password }` → `{ token, user }` |
+| GET | `/auth/me` | any | Current user |
+
+### Outlets
+
+| Method | Path | Who | Description |
+|---|---|---|---|
+| GET | `/outlets?isActive=` | HQ | List outlets |
+| POST | `/outlets` | HQ | Create `{ code, name, address? }` (also creates its receipt counter) |
+| GET | `/outlets/:outletId` | HQ, own staff | Get outlet |
+| PATCH | `/outlets/:outletId` | HQ | Update `{ name?, address?, isActive? }` (`code` is immutable) |
+
+### Master menu (HQ)
+
+| Method | Path | Who | Description |
+|---|---|---|---|
+| GET | `/menu-items?search=&category=&isActive=&page=&pageSize=` | HQ | Paginated list |
+| POST | `/menu-items` | HQ | Create `{ sku, name, basePrice, category?, description?, isActive? }` |
+| GET | `/menu-items/:menuItemId` | HQ | Get item |
+| PATCH | `/menu-items/:menuItemId` | HQ | Update name/description/category/basePrice/isActive |
+
+### Outlet menu (assignment + price override)
+
+| Method | Path | Who | Description |
+|---|---|---|---|
+| GET | `/outlets/:outletId/menu-items?availableOnly=` | HQ, own staff | **Only the items assigned to this outlet**, with `basePrice`, `priceOverride`, `effectivePrice`, `stock` |
+| PUT | `/outlets/:outletId/menu-items/:menuItemId` | HQ | Idempotent upsert: assign item and/or set `{ priceOverride (number \| null), isAvailable }`. 201 on create, 200 on update |
+| DELETE | `/outlets/:outletId/menu-items/:menuItemId` | HQ | Unassign (removes its stock row; history stays in the ledger) |
+
+### Inventory
+
+| Method | Path | Who | Description |
+|---|---|---|---|
+| GET | `/outlets/:outletId/inventory` | HQ, own staff | Stock per assigned item |
+| POST | `/outlets/:outletId/inventory/:menuItemId/adjustments` | HQ, own staff | `{ change, reason: RESTOCK \| WASTAGE \| ADJUSTMENT, note? }`; 409 `INSUFFICIENT_STOCK` if it would go negative |
+| GET | `/outlets/:outletId/inventory/movements?menuItemId=&limit=` | HQ, own staff | Stock ledger |
+
+### Sales
+
+| Method | Path | Who | Description |
+|---|---|---|---|
+| POST | `/outlets/:outletId/sales` | HQ, own staff | Create sale `{ items: [{ menuItemId, quantity }], clientCreatedAt? }`. Optional header **`Idempotency-Key`** makes retries safe (replay returns 200 + `Idempotent-Replayed: true`) |
+| GET | `/outlets/:outletId/sales?from=&to=&page=&pageSize=` | HQ, own staff | Paginated sales with lines |
+| GET | `/outlets/:outletId/sales/:saleId` | HQ, own staff | One sale |
+
+Sale errors: `409 INSUFFICIENT_STOCK` (lists every short item with requested/available),
+`422 ITEM_NOT_ASSIGNED`, `422 ITEM_UNAVAILABLE`, `409` if the outlet is inactive, `400 VALIDATION_ERROR`.
+
+### Reports (HQ)
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/reports/revenue-by-outlet?from=&to=` | Revenue, transaction count, items sold and average ticket per outlet, plus totals (outlets with no sales included) |
+| GET | `/reports/top-items?from=&to=&limit=5&outletId=` | Top N items per outlet by quantity sold (window function, one query) |
+
+`from`/`to` accept ISO dates or datetimes; the range is `[from, to)`, and a date-only `to` includes that whole day.
+
+### Health
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/health` | Liveness |
+| GET | `/health/ready` | Readiness (checks the database) |
+
+### Example
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"gulshan@fnb.test","password":"Password123!"}' | jq -r .data.token)
+
+OUTLET=$(curl -s localhost:8080/api/v1/auth/me -H "Authorization: Bearer $TOKEN" | jq -r .data.outletId)
+ITEM=$(curl -s "localhost:8080/api/v1/outlets/$OUTLET/menu-items?availableOnly=true" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.data[0].menuItemId')
+
+curl -s -X POST "localhost:8080/api/v1/outlets/$OUTLET/sales" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -H "Idempotency-Key: pos-1-$(date +%s)" \
+  -d "{\"items\":[{\"menuItemId\":\"$ITEM\",\"quantity\":2}]}" | jq .data.receiptNumber
+# "DHK-GUL-00000034"
+```
+
+---
+
+## How correctness is guaranteed
+
+Creating a sale runs in **one database transaction**:
+
+1. `SELECT … FROM inventory … ORDER BY menu_item_id FOR UPDATE` locks the outlet's stock rows for the cart
+   items in a **fixed order**, so concurrent sales can't deadlock.
+2. Validate assignment, availability and stock for **all** lines (the client gets every problem at once);
+   resolve prices server-side.
+3. Deduct stock with one guarded statement (`… WHERE quantity >= qty`); `CHECK (quantity >= 0)` backs it up.
+4. Take the next receipt number from the outlet's **counter row** (`INSERT … ON CONFLICT DO UPDATE …
+   RETURNING`). The row lock serialises only that outlet, and a rollback returns the number, so receipts
+   are **sequential, unique and gap-free per outlet**.
+5. Insert the sale, its lines (with price snapshots) and inventory-ledger rows.
+
+Any failure rolls back everything. An `Idempotency-Key` (unique per outlet) turns network retries and
+offline replays into safe no-ops, including when duplicates race each other.
+
+---
+
+## Testing
+
+```bash
+cd backend && npm test
+```
+
+40 integration tests run against a real PostgreSQL (no mocks), including:
+
+- **30 concurrent sales against stock 10** → exactly 10 succeed, 20 get `INSUFFICIENT_STOCK`, receipts are
+  exactly 1..10, final stock 0
+- two outlets selling concurrently → independent gap-free sequences
+- 8 concurrent requests with the same `Idempotency-Key` → exactly one sale, stock deducted once
+- carts locking the same items in opposite order → no deadlock
+- insufficient stock is atomic (no stock change, **no receipt number consumed**)
+- outlet sees only assigned items at its effective price; staff can't touch another outlet (403)
+- DB CHECK constraint rejects negative stock even when application code is bypassed
+- report correctness (revenue, transaction count, average ticket, top-N ranking, date filters)
+
+---
+
