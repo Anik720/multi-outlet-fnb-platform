@@ -238,3 +238,105 @@ requests with the same idempotency key → exactly one sale; opposite-order cart
 
 ---
 
+## 4. Scaling plan: 10 outlets, 100,000 transactions/month
+
+### 4.1 Sizing the problem
+
+| Metric | Estimate |
+|---|---|
+| Transactions / month | 100,000 |
+| Average | ≈ 3,300 / day ≈ **0.04 TPS** |
+| Peak (lunch/dinner: ~15% of a day's sales in the busiest hour, ×3 safety) | ≈ 500 / hour ≈ **0.4 TPS** |
+| Sale items (≈ 3 lines / sale) | ≈ 300k rows / month → **3.6M rows / year** |
+| Inventory movements | ≈ 3.6M rows / year |
+| Storage (sales + items + ledger, with indexes) | ≈ 2–3 GB / year |
+
+**Conclusion:** this is a modest OLTP load. A single, well-indexed PostgreSQL instance handles it with
+headroom of two or more orders of magnitude. The current design (stateless API, row-level locks scoped
+per outlet, per-outlet counters) already avoids global hot spots. The work is mostly about **reliability,
+reporting efficiency and operability**, not raw throughput. The plan below is staged so each step is taken
+when a metric says so, not up front.
+
+### 4.2 Database scaling strategies
+
+| Stage | Action | Trigger |
+|---|---|---|
+| 1 | **Managed PostgreSQL** (RDS / Cloud SQL / Neon) with automated backups, PITR, Multi-AZ standby for failover | Day 1 in production |
+| 2 | **Connection pooling** with PgBouncer (transaction mode) or RDS Proxy; small per-instance pools in the app | > 3–4 API instances, or serverless API |
+| 3 | **Read replica** for reporting and HQ dashboards; the app gets a separate read-only Prisma client | Reports noticeably load the primary (p95 checkout latency rises during report runs) |
+| 4 | **Partition `sales`, `sale_items`, `inventory_movements` by month** (declarative range partitioning on `created_at`) | ~50M+ rows, or when retention/archival is needed; old partitions detach to cheap storage |
+| 5 | **Archive cold data** (> 2 years) to object storage (Parquet) queried via the warehouse | Storage cost / backup time |
+| – | Keep: row-level locks per outlet (no table locks), short transactions, `EXPLAIN ANALYZE` on every new report query, `pg_stat_statements` to find slow queries | Always |
+
+Sharding is **not** needed at this scale. If it ever were (hundreds of outlets, multiple countries),
+`outlet_id` is the natural shard key: every write transaction is already scoped to one outlet.
+
+### 4.3 Reporting performance considerations
+
+The current reports aggregate raw `sales`/`sale_items` on each request. That's fine for thousands of rows
+per outlet and for the seeded data, but the cost grows linearly with history. The plan:
+
+1. **Pre-aggregated rollup table** `daily_outlet_item_sales (date, outlet_id, menu_item_id, qty, revenue,
+   txn_count)`, maintained **incrementally** (upsert in the sale transaction or from an outbox consumer).
+   "Revenue by outlet" and "top 5 items" then read ~10 outlets × ~50 items × N days, which stays small no
+   matter how many transactions there are. (A materialized view refreshed `CONCURRENTLY` every few minutes
+   is the simpler first step.)
+2. **Hybrid freshness:** rollups for closed days + live query for *today only* → real-time dashboards at
+   constant cost.
+3. **Serve reports from the read replica** so a heavy HQ query can never slow down a checkout.
+4. **Cache** hot dashboard queries in Redis for 30–60s, keyed by (report, range); invalidated or simply
+   left to expire.
+5. **Covering indexes** where plans show heap fetches, e.g. `sales (outlet_id, created_at) INCLUDE
+   (total_amount)` for revenue-by-outlet as an index-only scan.
+6. **Analytics beyond operational reports** (cohorts, basket analysis, forecasting) go to a warehouse
+   (BigQuery / Redshift / ClickHouse) fed by CDC (Debezium) or nightly exports. OLAP never runs on the
+   OLTP primary.
+7. **Time zones:** aggregate by outlet-local business day (store an `outlet.timezone`, compute
+   `business_date` at write time) so "today's sales" matches the outlet's day, not UTC.
+
+### 4.4 Infrastructure considerations
+
+```mermaid
+flowchart LR
+    U[Browsers / POS terminals] --> CDN[CDN<br/>static SPA]
+    U --> LB[Load balancer / API gateway<br/>TLS, WAF, rate limiting]
+    LB --> A1[API container 1]
+    LB --> A2[API container 2]
+    A1 & A2 --> PGB[PgBouncer]
+    PGB --> P[(Postgres primary)]
+    P -. streaming replication .-> RR[(Read replica<br/>reports)]
+    A1 & A2 --> RED[(Redis<br/>cache, rate-limit store)]
+    A1 & A2 --> OBS[Logs · metrics · traces]
+```
+
+* **Stateless API containers** (already true: JWT auth, no in-memory session) behind a load balancer on
+  ECS Fargate / Cloud Run / Kubernetes; autoscale on CPU and p95 latency; minimum 2 instances across AZs.
+* **Frontend on a CDN** (S3 + CloudFront / Netlify): static, cached, globally fast.
+* **CI/CD:** lint → typecheck → tests against a real Postgres service container → build image → run
+  `prisma migrate deploy` as a one-off release job → rolling / blue-green deploy. Migrations are written
+  expand-then-contract so old and new versions can run side by side.
+* **Secrets** in a secrets manager (not env files); `JWT_SECRET` rotation via key ids.
+* **Observability:** structured logs with request ids (already emitted) shipped to a log platform; RED
+  metrics (rate, errors, duration) per endpoint; OpenTelemetry tracing; alerts on checkout error rate,
+  p95 latency, DB connections, replication lag, and `INSUFFICIENT_STOCK` spikes (a business signal).
+* **Reliability:** health/readiness probes (already implemented), graceful shutdown (already implemented),
+  PITR backups with regular restore drills, documented RPO/RTO.
+* **Security:** TLS everywhere, WAF, per-user rate limiting, audit log for HQ actions (price changes,
+  assignments), refresh tokens with short-lived access tokens, and optional SSO for HQ staff.
+
+### 4.5 Architectural evolution
+
+1. **Now: modular monolith.** Layers are already separated and modules are cohesive (catalog, outlet
+   menu, inventory, sales, reporting). This is the right shape for this load and team size.
+2. **Transactional outbox.** Write `sale.completed` / `stock.adjusted` events to an `outbox` table in the
+   same transaction as the sale; a relay publishes them to a queue (SQS/SNS, RabbitMQ, or Kafka). This
+   decouples side effects (rollups, notifications, loyalty, KDS, accounting export) without
+   dual-write bugs.
+3. **Async projections.** Reporting rollups, low-stock alerts and the warehouse feed become consumers
+   of those events.
+4. **Extract services where boundaries are proven** (see §5), starting with reporting, the one that
+   benefits most from independent scaling and storage.
+5. **Offline-first POS** at the edge (see §6), which also improves resilience at every scale.
+
+---
+
