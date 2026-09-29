@@ -1,0 +1,211 @@
+// =============================================================================
+// Single company -> many outlets. HQ owns the master menu and assigns items to
+// outlets; each outlet keeps its own stock and issues its own receipt numbers.
+//
+// Prisma can't express CHECK constraints, expression indexes or triggers.
+// Those are appended by hand to the migration SQL (see prisma/migrations).
+// =============================================================================
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+  runtime      = "nodejs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum UserRole {
+  HQ_ADMIN
+  OUTLET_STAFF
+
+  @@map("user_role")
+}
+
+enum InventoryMovementReason {
+  RESTOCK
+  ADJUSTMENT
+  WASTAGE
+  SALE
+
+  @@map("inventory_movement_reason")
+}
+
+model Outlet {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code      String   @unique(map: "outlets_code_uq") @db.VarChar(20)
+  name      String   @db.VarChar(120)
+  address   String?
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  users              User[]
+  menuItems          OutletMenuItem[]
+  receiptCounter     OutletReceiptCounter?
+  sales              Sale[]
+  inventoryMovements InventoryMovement[]
+
+  @@map("outlets")
+}
+
+/// HQ admins see everything; outlet staff are pinned to exactly one outlet
+/// (enforced by users_role_outlet_chk).
+model User {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email        String   @db.VarChar(254) // unique on lower(email), see migration
+  passwordHash String   @map("password_hash")
+  fullName     String   @map("full_name") @db.VarChar(120)
+  role         UserRole
+  outletId     String?  @map("outlet_id") @db.Uuid
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  outlet             Outlet?             @relation(fields: [outletId], references: [id], onDelete: Restrict)
+  sales              Sale[]
+  inventoryMovements InventoryMovement[]
+
+  @@index([outletId], map: "users_outlet_id_idx")
+  @@map("users")
+}
+
+/// Master menu, owned by HQ.
+model MenuItem {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  sku         String   @unique(map: "menu_items_sku_uq") @db.VarChar(40)
+  name        String   @db.VarChar(120)
+  description String?
+  category    String?  @db.VarChar(60)
+  basePrice   Decimal  @map("base_price") @db.Decimal(12, 2)
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  outlets            OutletMenuItem[]
+  saleItems          SaleItem[]
+  inventoryMovements InventoryMovement[]
+
+  @@index([category], map: "menu_items_category_idx")
+  @@map("menu_items")
+}
+
+/// Outlet <-> menu assignment with an optional per-outlet price override.
+/// Effective price = COALESCE(price_override, menu_items.base_price).
+model OutletMenuItem {
+  outletId      String   @map("outlet_id") @db.Uuid
+  menuItemId    String   @map("menu_item_id") @db.Uuid
+  priceOverride Decimal? @map("price_override") @db.Decimal(12, 2)
+  isAvailable   Boolean  @default(true) @map("is_available")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  outlet    Outlet     @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  menuItem  MenuItem   @relation(fields: [menuItemId], references: [id], onDelete: Restrict)
+  inventory Inventory?
+
+  @@id([outletId, menuItemId], map: "outlet_menu_items_pk")
+  // The PK covers lookups by outlet; this covers "which outlets sell item X".
+  @@index([menuItemId], map: "outlet_menu_items_menu_item_idx")
+  @@map("outlet_menu_items")
+}
+
+/// Stock per (outlet, assigned item). Separate from the assignment row so hot
+/// stock updates don't contend with menu configuration. The composite FK means
+/// stock can only exist for assigned items; CHECK (quantity >= 0) is the last
+/// line of defence against negative stock.
+model Inventory {
+  outletId   String   @map("outlet_id") @db.Uuid
+  menuItemId String   @map("menu_item_id") @db.Uuid
+  quantity   Int      @default(0)
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  assignment OutletMenuItem @relation(fields: [outletId, menuItemId], references: [outletId, menuItemId], onDelete: Cascade, map: "inventory_assignment_fk")
+
+  @@id([outletId, menuItemId], map: "inventory_pk")
+  @@map("inventory")
+}
+
+/// Receipt counter per outlet, incremented inside the sale transaction under a
+/// row lock: numbers are sequential AND gap-free (a rolled-back sale rolls back
+/// its increment too). A native SEQUENCE would leave gaps on rollback.
+model OutletReceiptCounter {
+  outletId  String   @id @map("outlet_id") @db.Uuid
+  lastValue BigInt   @default(0) @map("last_value")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  outlet Outlet @relation(fields: [outletId], references: [id], onDelete: Cascade)
+
+  @@map("outlet_receipt_counters")
+}
+
+model Sale {
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  outletId        String    @map("outlet_id") @db.Uuid
+  receiptSeq      BigInt    @map("receipt_seq")
+  receiptNumber   String    @unique(map: "sales_receipt_number_uq") @map("receipt_number") @db.VarChar(40)
+  idempotencyKey  String?   @map("idempotency_key") @db.VarChar(100)
+  itemCount       Int       @map("item_count")
+  totalAmount     Decimal   @map("total_amount") @db.Decimal(12, 2)
+  createdById     String?   @map("created_by") @db.Uuid
+  clientCreatedAt DateTime? @map("client_created_at") @db.Timestamptz(3)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  outlet             Outlet              @relation(fields: [outletId], references: [id], onDelete: Restrict)
+  createdBy          User?               @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  items              SaleItem[]
+  inventoryMovements InventoryMovement[]
+
+  @@unique([outletId, receiptSeq], map: "sales_outlet_receipt_seq_uq")
+  // NULL keys are distinct in PostgreSQL, so sales without a key never collide.
+  @@unique([outletId, idempotencyKey], map: "sales_outlet_idempotency_uq")
+  // Sales history per outlet; every outlet-scoped report filters on this.
+  @@index([outletId, createdAt(sort: Desc)], map: "sales_outlet_created_at_idx")
+  // Company-wide date-range reports.
+  @@index([createdAt], map: "sales_created_at_idx")
+  @@map("sales")
+}
+
+model SaleItem {
+  id         BigInt  @id @default(autoincrement())
+  saleId     String  @map("sale_id") @db.Uuid
+  menuItemId String  @map("menu_item_id") @db.Uuid
+  itemName   String  @map("item_name") @db.VarChar(120) // snapshot at time of sale
+  unitPrice  Decimal @map("unit_price") @db.Decimal(12, 2) // snapshot of effective price
+  quantity   Int
+  lineTotal  Decimal @map("line_total") @db.Decimal(12, 2)
+
+  sale     Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  menuItem MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Restrict)
+
+  // Also serves lookups by sale_id (leading column).
+  @@unique([saleId, menuItemId], map: "sale_items_sale_menu_item_uq")
+  @@index([menuItemId], map: "sale_items_menu_item_idx")
+  @@map("sale_items")
+}
+
+/// Append-only stock ledger: every stock change is recorded for audit and
+/// reconciliation.
+model InventoryMovement {
+  id            BigInt                  @id @default(autoincrement())
+  outletId      String                  @map("outlet_id") @db.Uuid
+  menuItemId    String                  @map("menu_item_id") @db.Uuid
+  change        Int
+  quantityAfter Int                     @map("quantity_after")
+  reason        InventoryMovementReason
+  saleId        String?                 @map("sale_id") @db.Uuid
+  note          String?
+  createdById   String?                 @map("created_by") @db.Uuid
+  createdAt     DateTime                @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  outlet    Outlet   @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  menuItem  MenuItem @relation(fields: [menuItemId], references: [id], onDelete: Restrict)
+  sale      Sale?    @relation(fields: [saleId], references: [id], onDelete: SetNull)
+  createdBy User?    @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([outletId, menuItemId, createdAt(sort: Desc)], map: "inventory_movements_outlet_item_created_idx")
+  @@index([saleId], map: "inventory_movements_sale_idx")
+  @@map("inventory_movements")
+}
