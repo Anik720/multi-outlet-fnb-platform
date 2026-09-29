@@ -190,3 +190,51 @@ erDiagram
 
 ---
 
+## 3. Critical flow: creating a sale
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant POS
+    participant API as API (sale.service)
+    participant DB as PostgreSQL
+
+    POS->>API: POST /outlets/:id/sales<br/>Idempotency-Key: pos-7f3c…
+    API->>DB: SELECT sale WHERE (outlet, idempotency_key)
+    alt already processed
+        API-->>POS: 200 original sale (Idempotent-Replayed: true)
+    end
+    API->>DB: BEGIN
+    API->>DB: SELECT inventory … ORDER BY menu_item_id FOR UPDATE
+    Note over API,DB: row locks taken in a fixed order → no deadlocks
+    API->>API: validate: assigned? available? enough stock?<br/>resolve effective prices server-side
+    API->>DB: UPDATE inventory SET quantity = quantity - d.qty<br/>FROM unnest(ids, qtys) WHERE quantity >= d.qty
+    API->>DB: INSERT … ON CONFLICT DO UPDATE last_value = last_value + 1<br/>RETURNING last_value (receipt counter, row-locked)
+    API->>DB: INSERT sales, sale_items, inventory_movements
+    API->>DB: COMMIT
+    API-->>POS: 201 { receiptNumber: "DHK-GUL-00000042", … }
+```
+
+**Why it is correct under concurrency**
+
+* **No overselling:** concurrent sales of the same item serialise on the inventory row lock. The second
+  transaction re-reads the *committed* quantity after the first commits (READ COMMITTED + `FOR UPDATE`), so
+  it sees the real remaining stock. The guarded `UPDATE … WHERE quantity >= qty` and the CHECK constraint are
+  two more independent safety nets.
+* **Sequential, unique, gap-free receipts per outlet:** the counter row is locked until COMMIT/ROLLBACK, so
+  only one transaction per outlet holds "the next number" at a time; a failed sale rolls its number back.
+  Different outlets have different counter rows and never block each other. The lock is taken *last* to keep
+  the per-outlet critical section as short as possible.
+* **No deadlocks:** every transaction locks inventory rows in `menu_item_id` order, then the counter.
+  A consistent global lock order makes lock cycles impossible.
+* **All-or-nothing:** one DB transaction; any error rolls back stock, receipt number, sale and ledger.
+* **Retry-safe:** idempotency key pre-check + unique constraint. If two identical requests race, the loser's
+  unique violation is caught and the winner's sale is returned.
+
+These properties are **verified by integration tests** against a real PostgreSQL
+(`backend/tests/sales.test.ts`): 30 parallel requests against stock 10 → exactly 10 sales, receipts
+1..10, stock 0; two outlets selling concurrently keep independent gap-free sequences; 8 concurrent
+requests with the same idempotency key → exactly one sale; opposite-order carts → no deadlock.
+
+---
+
