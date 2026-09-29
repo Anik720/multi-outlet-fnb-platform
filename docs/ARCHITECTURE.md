@@ -340,3 +340,82 @@ flowchart LR
 
 ---
 
+## 5. Evolving to microservices
+
+### 5.1 Guiding principle
+
+Split along **business capabilities with clear data ownership**, and only when there is a concrete reason:
+independent scaling, independent release cadence, a different team, or a different storage/consistency
+model. The current layering (routes → controllers → services → repositories) and module boundaries are
+deliberately the seams along which services would be cut.
+
+### 5.2 Proposed services
+
+```mermaid
+flowchart TB
+    GW[API Gateway / BFF<br/>auth, routing, rate limits]
+
+    subgraph Core
+        ID[Identity & Access<br/>users, roles, JWT/SSO]
+        CAT[Catalog Service<br/>master menu, outlet assignment, pricing]
+        INV[Inventory Service<br/>stock per outlet, ledger, reservations]
+        ORD[Sales / Order Service<br/>checkout, receipts, idempotency]
+    end
+
+    subgraph Async
+        BUS{{Event bus<br/>Kafka / SNS+SQS}}
+        REP[Reporting Service<br/>rollups, dashboards]
+        NOTIF[Notification Service<br/>low stock, alerts]
+        SYNC[POS Sync Service<br/>offline batches]
+    end
+
+    GW --> ID & CAT & INV & ORD & REP & SYNC
+    ORD -- "reserve/commit stock (sync)" --> INV
+    ORD -- "price & availability (sync, cached)" --> CAT
+    ORD -- sale.completed --> BUS
+    INV -- stock.low / stock.adjusted --> BUS
+    CAT -- menu.updated / price.changed --> BUS
+    BUS --> REP & NOTIF & INV
+    SYNC --> ORD
+```
+
+| Service | Owns (its own DB/schema) | Why separate |
+|---|---|---|
+| **Identity & Access** | users, roles, outlet membership, sessions | Security-sensitive, reused by every service; SSO/MFA evolve independently |
+| **Catalog** | menu_items, outlet_menu_items (prices, availability) | Read-heavy, rarely written, highly cacheable; HQ's domain; publishes `menu.updated` so outlets/POS can cache menus |
+| **Inventory** | inventory, inventory_movements | The contention hot spot; may later add recipes/ingredients, suppliers, purchase orders, which is a large domain of its own |
+| **Sales / Order** | sales, sale_items, receipt counters, idempotency keys | The critical write path; scales with transaction volume; strongest consistency needs |
+| **Reporting** | read-optimised projections (rollups, warehouse) | Completely different access pattern (OLAP), scales independently, must never slow checkout |
+| **POS Sync** | device registry, sync cursors, batch status | Handles offline replay, device auth and conflicts (see §6) |
+| **Notification** | templates, delivery log | Pure event consumer |
+
+### 5.3 The hard part: consistency across services
+
+In the monolith, "deduct stock + issue receipt + record sale" is one ACID transaction. Across services
+it becomes a **saga**:
+
+1. Order service creates the sale as `PENDING` and calls Inventory `reserve(items, saleId)`
+   (idempotent, keyed by saleId).
+2. On success → Order allocates the receipt number (still a local per-outlet counter), marks the sale
+   `COMPLETED`, and publishes `sale.completed` through its **outbox**.
+3. Inventory consumes `sale.completed` and converts the reservation to a deduction; on `sale.failed` or a
+   reservation timeout it releases stock (**compensation**).
+
+Supporting patterns: transactional outbox + idempotent consumers (at-least-once delivery), correlation ids
+across services, contract-tested APIs, schema-versioned events.
+
+### 5.4 Migration path (strangler fig)
+
+1. Enforce module boundaries inside the monolith (no cross-module table access; modules talk through
+   service interfaces). The layered code already mostly does this.
+2. Introduce the outbox + event bus while still a monolith.
+3. Extract **Reporting** first: read-only, event-fed, lowest risk, highest benefit.
+4. Extract **Catalog** (read-mostly, simple consistency).
+5. Extract **Inventory + Order** last, together with the saga, only if scale or team structure demands it.
+
+**Honest trade-off:** at 10 outlets and 100k transactions/month, a well-structured modular monolith is
+cheaper to run, simpler to operate and *more* consistent. Microservices should be adopted incrementally,
+when organisational or scaling pressure actually appears.
+
+---
+
