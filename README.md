@@ -11,13 +11,32 @@ A central HQ system for a food & beverage company with multiple outlets.
 | **Override the price** per outlet | Ring up **multi-item sales** (POS), which deduct its stock |
 | See **revenue by outlet** and **top 5 items per outlet** | Get **sequential, per-outlet receipt numbers** that stay correct under concurrency |
 
+## Live demo
+
+| | URL |
+|---|---|
+| **Web app** (HQ console + outlet POS) | **https://fnb-hq-web.onrender.com** |
+| **API** | https://fnb-hq-api.onrender.com/api/v1 (health: [/health/ready](https://fnb-hq-api.onrender.com/health/ready)) |
+
+Sign in with a demo account (the login page has one-click buttons). Password for all: **`Password123!`**
+
+| Email | Role |
+|---|---|
+| `hq@fnb.test` | HQ admin: dashboard, master menu, outlets, assignments, price overrides |
+| `gulshan@fnb.test` · `dhanmondi@fnb.test` · `agrabad@fnb.test` | Outlet staff: POS, inventory and sales for their own outlet |
+
+> Hosted on Render's free tier: after ~15 minutes without traffic the API sleeps, so the **first request can
+> take up to ~50 seconds**. Everything is fast after that.
+
 > 📐 Full architecture document (ERD, scaling plan, microservices, offline POS/KDS):
-> **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**
+> **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** · also as a Word document:
+> **[docs/Architecture-Documentation.docx](docs/Architecture-Documentation.docx)**
 
 ---
 
 ## Table of contents
 
+- [Live demo](#live-demo)
 - [Tech stack](#tech-stack)
 - [Quick start (Docker)](#quick-start-docker)
 - [Local development](#local-development)
@@ -160,7 +179,9 @@ Password for all accounts: **`Password123!`** (the login page has one-click butt
 │   │       └── outlet/              # POS, inventory, sales
 │   ├── nginx.conf                   # SPA + /api reverse proxy
 │   └── Dockerfile
-├── docs/ARCHITECTURE.md             # ERD, scaling plan, microservices, offline POS
+├── docs/
+│   ├── ARCHITECTURE.md              # ERD, scaling plan, microservices, offline POS
+│   └── Architecture-Documentation.docx  # same document in Word format, with data dictionary
 ├── docker-compose.yml
 └── render.yaml                      # one-click cloud deploy blueprint
 ```
@@ -394,7 +415,7 @@ nginx + Let's Encrypt) in front of port 8080.
 `CORS_ORIGINS` on the API to the web URL and `VITE_API_BASE_URL` on the web app to
 `https://<api-host>/api/v1`, then redeploy the web app.
 
-**Deployed instance:** _add the URL here after deploying._
+**Deployed instance:** web https://fnb-hq-web.onrender.com · API https://fnb-hq-api.onrender.com/api/v1 (see [Live demo](#live-demo)).
 
 ---
 

@@ -510,7 +510,7 @@ sequenceDiagram
         end
     end
     API-->>POS: per-sale results {saleId, status, receiptNumber}
-    POS->>POS: mark SYNCED; keep failures for review
+    POS->>POS: mark SYNCED, keep failures for review
     POS->>API: GET /sync/changes?since=cursor<br/>(menu, prices, availability, stock)
     API-->>POS: delta + new cursor
 ```
