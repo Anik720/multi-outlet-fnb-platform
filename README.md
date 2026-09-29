@@ -127,3 +127,102 @@ Password for all accounts: **`Password123!`** (the login page has one-click butt
 
 ---
 
+## Project structure
+
+```
+.
+├── backend/
+│   ├── prisma/
+│   │   ├── schema.prisma            # data model (source of truth for the ORM)
+│   │   └── migrations/              # SQL migrations (+ hand-written CHECKs, triggers, indexes)
+│   ├── src/
+│   │   ├── config/                  # env validation (zod), logger
+│   │   ├── db/                      # Prisma client + transaction helper, seed
+│   │   ├── routes/                  # URL → middleware chain → controller
+│   │   ├── controllers/             # HTTP in/out only
+│   │   ├── services/                # business rules, transactions
+│   │   ├── repositories/            # data access (Prisma + raw SQL)
+│   │   ├── validators/              # zod request schemas (+ inferred TS types)
+│   │   ├── middlewares/             # auth, tenant guard, validation, error handler
+│   │   ├── mappers/                 # DB rows → API DTOs
+│   │   ├── utils/                   # errors, money (cents), pagination, db error mapping
+│   │   ├── app.ts                   # express app factory (used by server + tests)
+│   │   └── server.ts                # bootstrap + graceful shutdown
+│   ├── tests/                       # integration tests (Vitest + Supertest, real Postgres)
+│   └── Dockerfile
+├── frontend/
+│   ├── src/
+│   │   ├── api/                     # typed API client + endpoints
+│   │   ├── auth/                    # auth context (JWT)
+│   │   ├── components/              # layout, UI primitives, revenue chart
+│   │   └── pages/
+│   │       ├── hq/                  # dashboard, master menu, outlets, outlet detail
+│   │       └── outlet/              # POS, inventory, sales
+│   ├── nginx.conf                   # SPA + /api reverse proxy
+│   └── Dockerfile
+├── docs/ARCHITECTURE.md             # ERD, scaling plan, microservices, offline POS
+├── docker-compose.yml
+└── render.yaml                      # one-click cloud deploy blueprint
+```
+
+---
+
+## Architecture
+
+```
+HTTP ─▶ routes ─▶ middlewares ─▶ controllers ─▶ services ─▶ repositories ─▶ PostgreSQL
+         (URL)    auth · role ·   (HTTP only)    (business    (Prisma +
+                  tenant guard ·                  rules, tx)   raw SQL)
+                  zod validation
+                                      errors ─▶ central error middleware ─▶ { error: { code, message, details, requestId } }
+```
+
+- **Routes** declare the middleware chain per endpoint: `authenticate` → `requireRole` / `authorizeOutlet`
+  → `validate({ params, query, body })` → controller.
+- **Controllers** are thin: they read `req.valid` (already validated and coerced) and call one service.
+- **Services** own business rules and transaction boundaries (`withTransaction`), and throw typed
+  `AppError`s (`NOT_FOUND`, `INSUFFICIENT_STOCK`, `ITEM_NOT_ASSIGNED`, …).
+- **Repositories** are the only code that talks to the database. They accept an optional transaction
+  client, so services can compose several repository calls into one transaction.
+- **Error middleware** maps `AppError`s, malformed JSON, and PostgreSQL constraint violations
+  (unique / FK / CHECK / deadlock) to proper 4xx/5xx responses with a request id. Unknown errors → 500
+  without leaking internals in production.
+- **Tenant isolation** is enforced server-side: staff tokens carry their `outletId`, and every
+  `/outlets/:outletId/**` route rejects other outlets with 403.
+
+**Why Prisma + raw SQL?** Prisma gives the schema/migration workflow and type-safe CRUD. The
+checkout path needs `SELECT … FOR UPDATE` with a deterministic lock order, a set-based guarded stock
+`UPDATE … FROM unnest(…)`, and an atomic `INSERT … ON CONFLICT … RETURNING` counter; reports need window
+functions. Those are written as parameterised raw SQL (`$queryRaw` tagged templates, so no injection risk)
+inside the repository layer. Prisma can't express CHECK constraints or expression indexes, so those are
+added by hand to the migration SQL. `prisma migrate diff` confirms that schema and database have no drift.
+
+More detail, including diagrams: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#1-system-overview).
+
+---
+
+## Database schema
+
+Full ERD with every column and constraint: **[docs/ARCHITECTURE.md → ERD](docs/ARCHITECTURE.md#2-erd-database-schema-and-relationships)**.
+
+| Table | Purpose | Notable constraints |
+|---|---|---|
+| `outlets` | Outlets of the company | `code` unique + format CHECK (used as receipt prefix, immutable) |
+| `users` | HQ admins and outlet staff | unique `lower(email)`; CHECK: staff ⇔ `outlet_id` set |
+| `menu_items` | HQ master menu | `sku` unique; `base_price >= 0` |
+| `outlet_menu_items` | Which items an outlet sells + `price_override` | PK `(outlet_id, menu_item_id)`; override `>= 0` |
+| `inventory` | Stock per outlet per assigned item | composite FK → `outlet_menu_items`; **`CHECK (quantity >= 0)`** |
+| `outlet_receipt_counters` | Per-outlet receipt sequence | one row per outlet; incremented inside the sale transaction |
+| `sales` | Sale header | unique `(outlet_id, receipt_seq)`, unique `receipt_number`, unique `(outlet_id, idempotency_key)` |
+| `sale_items` | Sale lines with price/name snapshots | unique `(sale_id, menu_item_id)`; `quantity > 0` |
+| `inventory_movements` | Append-only stock ledger | reason enum; `quantity_after >= 0` |
+
+- **Effective price** = `COALESCE(outlet_menu_items.price_override, menu_items.base_price)`, resolved
+  **server-side** at checkout; clients never send prices.
+- **Money** is `NUMERIC(12,2)` in the DB and integer cents in code; there is no floating-point arithmetic.
+- **Indexes** cover every frequent query: outlet menu, stock lookups, sales history per outlet
+  (`(outlet_id, created_at DESC)`), date-range reports (`created_at`), top-items joins, ledger history.
+  See the [index table](docs/ARCHITECTURE.md#indexes-and-the-queries-they-serve).
+
+---
+
