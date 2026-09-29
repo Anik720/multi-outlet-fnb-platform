@@ -419,3 +419,138 @@ when organisational or scaling pressure actually appears.
 
 ---
 
+## 6. Offline POS mode strategy (POS + KDS)
+
+### 6.1 Goals
+
+* An outlet keeps **taking orders, printing receipts and cooking** with no internet.
+* When connectivity returns, every offline sale reaches HQ **exactly once**, in order, with stock and
+  reports reconciled.
+* POS and Kitchen Display System (KDS) keep talking to each other on the **local network** throughout.
+
+### 6.2 Outlet edge architecture
+
+```mermaid
+flowchart LR
+    subgraph Outlet["Outlet LAN (works without internet)"]
+        P1[POS terminal 1<br/>local DB: SQLite/IndexedDB]
+        P2[POS terminal 2]
+        HUB[Outlet Edge Hub<br/>mini-PC or primary POS<br/>local Postgres/SQLite + message broker<br/>MQTT / WebSocket]
+        KDS1[KDS - Grill]
+        KDS2[KDS - Drinks]
+        PR[Receipt printer]
+    end
+    CLOUD[(HQ Cloud API)]
+
+    P1 <-- orders / status --> HUB
+    P2 <-- orders / status --> HUB
+    HUB <-- tickets / bump events --> KDS1
+    HUB <-- tickets / bump events --> KDS2
+    P1 --> PR
+    HUB <-. "sync when online<br/>(outbox upload, menu/stock download)" .-> CLOUD
+```
+
+* **Local-first POS:** every terminal has its own durable store (SQLite in a native/Electron app,
+  IndexedDB in a PWA). The UI always writes locally first; the network is never on the critical path of
+  ringing up a sale.
+* **Outlet Edge Hub:** a small always-on device (or the primary POS) running a local database and a
+  lightweight message broker (MQTT such as Mosquitto, or a WebSocket server). It is the outlet's source
+  of truth while offline and the single sync gateway to HQ.
+* **Service discovery on the LAN** via mDNS or a fixed local IP, so terminals and KDS find the hub
+  without internet or cloud DNS.
+
+### 6.3 POS ↔ KDS communication while offline
+
+1. POS creates an order → publishes `order.created` to the hub topic `outlet/{id}/kitchen` (MQTT QoS 1,
+   persistent session), or directly on the LAN WebSocket.
+2. The hub routes items to the right station (grill, drinks) using station mappings from the **cached
+   menu**; each KDS subscribes to its station topic.
+3. The KDS shows the ticket; cooks publish `item.started` / `order.bumped` back; POS updates order status
+   in real time.
+4. **Reliability:** QoS 1 (at-least-once) plus idempotent handlers keyed by `orderId` + event id; a KDS
+   that reconnects replays missed messages from its persistent session; each device also keeps a local
+   copy of open tickets, so a hub reboot doesn't lose the kitchen queue.
+5. **Hub failure fallback:** POS can print kitchen chit tickets on a local printer, and terminals can
+   fail over to peer-to-peer WebSocket with a designated backup hub.
+
+Nothing in this loop touches the internet, so kitchen operations are identical online and offline.
+
+### 6.4 Offline sales and receipt numbers
+
+* Each sale gets a **client-generated UUID** (`saleId`), which doubles as the **Idempotency-Key**. It is
+  created once, stored with the sale, and never regenerated.
+* **Offline receipt numbers must be unique without a central counter.** Two options:
+  * *Device-prefixed numbering (recommended):* `{OUTLET}-{DEVICE}-{seq}`, e.g. `DHK-GUL-T2-000731`. Each
+    terminal owns its own monotonic, gap-free local sequence, so numbers are unique by construction and
+    printable immediately.
+  * *Block allocation:* while online, the hub leases a block of numbers (e.g. 1001–2000) from HQ's
+    per-outlet counter; offline terminals draw from their local block.
+* The official HQ receipt number (the per-outlet sequence this API issues) can be assigned at sync time
+  and linked to the offline number; both are stored (`client_receipt_number`, `receipt_number`), and the
+  printed receipt remains valid.
+* `client_created_at` (already in the schema and API) stores when the sale actually happened, so reports
+  attribute offline sales to the right hour/day instead of the sync time.
+
+### 6.5 Sync protocol when the internet reconnects
+
+```mermaid
+sequenceDiagram
+    participant POS as POS / Edge Hub (outbox)
+    participant API as HQ Sync API
+    participant DB as HQ DB
+
+    Note over POS: offline: sales appended to local outbox<br/>(status = PENDING, ordered by local seq)
+    POS->>API: POST /sync/sales (batch of N, oldest first)<br/>each with saleId = Idempotency-Key, clientCreatedAt, device seq
+    loop each sale in order
+        API->>DB: same transactional create-sale path<br/>(idempotent on saleId)
+        alt new
+            DB-->>API: created (receipt no. assigned)
+        else already synced (retry)
+            DB-->>API: existing sale returned
+        end
+    end
+    API-->>POS: per-sale results {saleId, status, receiptNumber}
+    POS->>POS: mark SYNCED; keep failures for review
+    POS->>API: GET /sync/changes?since=cursor<br/>(menu, prices, availability, stock)
+    API-->>POS: delta + new cursor
+```
+
+Details:
+
+1. **Outbox pattern on the device.** A sale is committed locally together with an outbox record in one
+   local transaction. A background sync worker drains the outbox oldest-first with exponential backoff and
+   jitter; it resumes after crashes and reboots.
+2. **Idempotency end-to-end.** The server already supports `Idempotency-Key` with a unique constraint, so
+   resending a batch after a timeout never double-charges or double-deducts stock. This is implemented and
+   tested in this repository.
+3. **Batching and ordering.** Batches of e.g. 50, processed in device order; each sale is its own
+   transaction so one bad sale doesn't block the rest; per-sale results come back.
+4. **Stock conflicts: sales are facts.** Food already served cannot be un-sold. Offline, the device keeps a
+   *local projection* of stock (last server snapshot minus local sales) and warns or blocks at zero. At
+   sync time, if the server would go negative, the sync path accepts the sale and records a
+   **`stock_discrepancy`** ledger entry, holding stock at 0 instead of rejecting the sale. HQ gets a
+   reconciliation report. The normal online path keeps rejecting oversells, so the invariant "stock never
+   negative" still holds, and every exception is explicit and auditable.
+5. **Price conflicts.** The sale keeps the price the customer actually paid (snapshotted on the device
+   from its cached menu version, sent with `menuVersion`). If HQ changed the price meanwhile, the sale is
+   still accepted and flagged for review.
+6. **Downstream sync (HQ → outlet).** Menu, prices, availability and stock are pulled as **deltas since a
+   cursor** (`updated_at`/version), or pushed via WebSocket/SSE when online. Devices always keep the last
+   full snapshot, so they can boot and sell offline.
+7. **Clock skew.** Devices sync time via NTP when online; the server records both `client_created_at`
+   and its own `created_at`, and rejects or flags absurd client timestamps.
+8. **Security.** Each device has its own credential (device token or mTLS) scoped to one outlet; the local
+   DB is encrypted at rest; offline sessions use PINs validated against a cached, hashed staff list.
+9. **Visibility.** POS shows a clear "Offline · 12 sales pending sync" indicator; HQ sees last-sync time
+   per device and alerts on devices that haven't synced within N hours.
+
+### 6.6 What is already implemented in this codebase
+
+| Capability | Status |
+|---|---|
+| Idempotent `POST /sales` via `Idempotency-Key` (unique per outlet, race-safe) | ✅ implemented + tested |
+| `clientCreatedAt` stored separately from server `created_at` | ✅ implemented |
+| POS UI keeps one idempotency key per checkout attempt, so retries are safe | ✅ implemented |
+| Server-side price resolution + price/name snapshots on sale lines | ✅ implemented |
+| Inventory ledger for reconciliation | ✅ implemented |
+| Local outbox, edge hub, KDS messaging, batch sync endpoint | 📄 designed above |
